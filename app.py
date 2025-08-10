@@ -20,7 +20,7 @@ def load_data():
     if path is None:
         up = st.file_uploader("Upload Social_Media_Advertising.csv", type=["csv"])
         if up:
-            path = "data/Social_Media_Advertising.csv"
+            path = "Social_Media_Advertising.csv"
             with open(path, "wb") as f: f.write(up.read())
         else:
             st.stop()
