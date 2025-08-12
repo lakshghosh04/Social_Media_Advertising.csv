@@ -1,303 +1,215 @@
-# app.py — Upload-first Social Media Ads BI (CSV/ZIP + column mapper)
-import os, io, zipfile
-import streamlit as st
-import pandas as pd
+import os
 import numpy as np
+import pandas as pd
+import streamlit as st
 import plotly.express as px
 
-st.set_page_config(page_title="Social Media Ads BI", layout="wide")
-st.title("📊 Social Media Advertising — BI Dashboard")
-st.caption("Build v13 — upload your own CSV/ZIP")
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import r2_score, mean_absolute_error
 
-# -------------------------
-# 1) Upload / load helpers
-# -------------------------
-REQUIRED = [
-    "Date", "Channel_Used", "Target_Audience",
-    "Impressions", "Clicks", "Conversion_Rate", "ROI"
-]
+st.set_page_config(page_title="Social Media Ads BI + Prediction", layout="wide")
+st.title("📊 Social Media Advertising — BI + Prediction")
+
+REQUIRED = ["Date", "Channel_Used", "Target_Audience", "Impressions", "Clicks", "Conversion_Rate", "ROI"]
 OPTIONAL = ["Company", "Location", "Campaign_Goal", "Engagement_Score", "Acquisition_Cost"]
 
-def read_uploaded(file) -> pd.DataFrame | None:
-    """Read CSV directly or first CSV inside a ZIP."""
-    name = file.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(file, encoding="utf-8", encoding_errors="replace")
-    if name.endswith(".zip"):
-        with zipfile.ZipFile(io.BytesIO(file.read())) as z:
-            csvs = [n for n in z.namelist() if n.lower().endswith(".csv")]
-            if not csvs: 
-                st.error("ZIP has no CSV inside.")
-                return None
-            with z.open(csvs[0]) as f:
-                return pd.read_csv(f, encoding="utf-8", encoding_errors="replace")
-    st.error("Please upload a .csv or .zip containing a CSV.")
-    return None
+st.sidebar.header("Upload CSV")
+up = st.sidebar.file_uploader("Choose a CSV (must include required columns)", type=["csv"])
 
-def coerce_numeric(df, cols):
-    for c in cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
-
-def parse_date(df, col):
-    df[col] = pd.to_datetime(df[col], errors="coerce")
-    return df
-
-# -------------------------
-# 2) Sidebar: Upload + mapping
-# -------------------------
-st.sidebar.header("📥 Upload your data")
-up = st.sidebar.file_uploader("Upload CSV or ZIP", type=["csv", "zip"])
-
-if "df" not in st.session_state:
-    st.session_state.df = None
-
+# --- load data
 if up:
-    raw_df = read_uploaded(up)
-    if raw_df is not None and len(raw_df):
-        st.session_state.df = raw_df
+    df = pd.read_csv(up, encoding="utf-8", encoding_errors="replace")
+else:
+    path = "data/Social_Media_Advertising.csv"
+    if os.path.exists(path):
+        df = pd.read_csv(path, encoding="utf-8", encoding_errors="replace")
+    else:
+        st.info("Upload a CSV or place Social_Media_Advertising.csv in /data")
+        st.stop()
 
-if st.session_state.df is None:
-    st.info("Upload a CSV or a ZIP with a CSV to begin. Expected fields include: " + ", ".join(REQUIRED + OPTIONAL))
+if not set(REQUIRED).issubset(df.columns):
+    st.error("Missing columns: " + ", ".join([c for c in REQUIRED if c not in df.columns]))
+    st.dataframe(df.head(), use_container_width=True)
     st.stop()
 
-df = st.session_state.df.copy()
-st.write("### Preview")
-st.dataframe(df.head(), use_container_width=True)
+# --- basic prep
+df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+for c in ["Impressions", "Clicks", "Conversion_Rate", "ROI", "Engagement_Score"]:
+    if c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+# CTR
+df["CTR"] = np.where(df["Impressions"] > 0, df["Clicks"] / df["Impressions"], np.nan)
 
-# -------------------------
-# 3) Column mapping (simple)
-# -------------------------
-st.write("### Column mapping")
-mapping = {}
-for need in REQUIRED + OPTIONAL:
-    candidates = ["(none)"] + df.columns.tolist()
-    default = candidates.index(need) if need in df.columns else 0
-    mapping[need] = st.selectbox(f"Select column for **{need}**", candidates, index=default)
+tab1, tab2 = st.tabs(["📈 Dashboard", "🤖 Prediction"])
 
-# Ensure required mapped
-missing = [k for k,v in mapping.items() if k in REQUIRED and v == "(none)"]
-if missing:
-    st.error(f"Please map required fields: {', '.join(missing)}")
-    st.stop()
+with tab1:
+    st.subheader("Filters")
+    dmin, dmax = df["Date"].min(), df["Date"].max()
+    date_range = st.date_input("Date range", (dmin, dmax))
+    f = df.copy()
+    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+        start, end = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
+        f = f[(f["Date"] >= start) & (f["Date"] <= end)]
 
-# Build normalized frame
-norm = pd.DataFrame()
-for k,v in mapping.items():
-    if v != "(none)":
-        norm[k] = df[v]
+    def opts(col):
+        return ["All"] + sorted(f[col].dropna().unique().tolist()) if col in f.columns else ["All"]
 
-# Clean/parse types
-if "Date" in norm.columns:
-    norm = parse_date(norm, "Date")
-num_cols = ["Conversion_Rate", "ROI", "Clicks", "Impressions", "Engagement_Score"]
-norm = coerce_numeric(norm, num_cols)
+    colA, colB, colC, colD = st.columns(4)
+    sel_channel  = colA.selectbox("Channel",  opts("Channel_Used"))
+    sel_audience = colB.selectbox("Audience", opts("Target_Audience"))
+    sel_company  = colC.selectbox("Company",  opts("Company") if "Company" in f.columns else ["All"])
+    sel_loc      = colD.selectbox("Location", opts("Location") if "Location" in f.columns else ["All"])
 
-# Acquisition_Cost may be like "$500"
-if "Acquisition_Cost" in norm.columns:
-    norm["Acquisition_Cost_Num"] = (
-        norm["Acquisition_Cost"]
-        .astype(str)
-        .str.replace(r"[^0-9.\-]", "", regex=True)
-        .replace("", np.nan)
-        .astype(float)
-    )
-else:
-    norm["Acquisition_Cost_Num"] = np.nan
+    if sel_channel != "All":  f = f[f["Channel_Used"] == sel_channel]
+    if sel_audience != "All": f = f[f["Target_Audience"] == sel_audience]
+    if sel_company != "All" and "Company" in f.columns:  f = f[f["Company"] == sel_company]
+    if sel_loc != "All" and "Location" in f.columns:     f = f[f["Location"] == sel_loc]
 
-# Derived metrics
-norm["CTR"] = np.where(norm["Impressions"] > 0, norm["Clicks"] / norm["Impressions"], np.nan)
-est_conversions = np.where(
-    (norm["Conversion_Rate"].notna()) & (norm["Impressions"].notna()),
-    norm["Conversion_Rate"] * norm["Impressions"],
-    np.nan
-)
-norm["Est_Spend"] = norm["Acquisition_Cost_Num"] * est_conversions
+    # KPIs
+    total_impr  = int(f["Impressions"].sum())
+    total_clicks = int(f["Clicks"].sum())
+    avg_ctr = (f["CTR"].mean() * 100) if f["CTR"].notna().any() else 0
+    avg_roi = f["ROI"].mean() if "ROI" in f.columns else np.nan
+    avg_cr  = (f["Conversion_Rate"].mean() * 100) if "Conversion_Rate" in f.columns else np.nan
 
-# -------------------------
-# 4) Filters
-# -------------------------
-st.sidebar.header("🔎 Filters")
-if norm["Date"].notna().any():
-    dmin, dmax = norm["Date"].min(), norm["Date"].max()
-    date_range = st.sidebar.date_input("Date range", (dmin.date() if pd.notna(dmin) else None,
-                                                      dmax.date() if pd.notna(dmax) else None))
-else:
-    date_range = None
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Impressions", f"{total_impr:,}")
+    k2.metric("Clicks", f"{total_clicks:,}")
+    k3.metric("Avg CTR", f"{avg_ctr:.2f}%")
+    k4.metric("Avg ROI", f"{avg_roi:.2f}" if pd.notna(avg_roi) else "—")
 
-def opt_values(col):
-    return ["All"] + sorted(norm[col].dropna().unique().tolist()) if col in norm.columns else ["All"]
+    st.subheader("Trends")
+    daily = f.groupby("Date").agg(Impressions=("Impressions","sum"),
+                                  Clicks=("Clicks","sum"),
+                                  ROI=("ROI","mean"),
+                                  CR=("Conversion_Rate","mean")).reset_index()
+    if len(daily):
+        daily["CTR"] = np.where(daily["Impressions"]>0, daily["Clicks"]/daily["Impressions"], np.nan)
+        st.plotly_chart(px.line(daily, x="Date", y="CTR", markers=True, title="CTR over time"), use_container_width=True)
+        st.plotly_chart(px.line(daily, x="Date", y="ROI", markers=True, title="ROI over time"), use_container_width=True)
+    else:
+        st.info("No rows to plot after filters.")
 
-sel_channel  = st.sidebar.selectbox("Channel",  opt_values("Channel_Used"))
-sel_audience = st.sidebar.selectbox("Audience", opt_values("Target_Audience"))
-sel_company  = st.sidebar.selectbox("Company",  opt_values("Company") if "Company" in norm.columns else ["All"])
-sel_loc      = st.sidebar.selectbox("Location", opt_values("Location") if "Location" in norm.columns else ["All"])
+    st.subheader("Channel performance")
+    if "Channel_Used" in f.columns and len(f):
+        by_ch = f.groupby("Channel_Used").agg(Impressions=("Impressions","sum"),
+                                              Clicks=("Clicks","sum"),
+                                              ROI=("ROI","mean")).reset_index()
+        by_ch["CTR"] = np.where(by_ch["Impressions"]>0, by_ch["Clicks"]/by_ch["Impressions"], np.nan)
+        cA, cB = st.columns(2)
+        cA.plotly_chart(px.bar(by_ch, x="Channel_Used", y="CTR", title="CTR by channel"), use_container_width=True)
+        cB.plotly_chart(px.bar(by_ch, x="Channel_Used", y="ROI", title="ROI by channel"), use_container_width=True)
 
-f = norm.copy()
-if date_range and isinstance(date_range, (list, tuple)) and len(date_range) == 2 and all(date_range):
-    start, end = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
-    f = f[(f["Date"] >= start) & (f["Date"] <= end)]
-if sel_channel != "All":
-    f = f[f["Channel_Used"] == sel_channel]
-if sel_audience != "All":
-    f = f[f["Target_Audience"] == sel_audience]
-if sel_company != "All" and "Company" in f.columns:
-    f = f[f["Company"] == sel_company]
-if sel_loc != "All" and "Location" in f.columns:
-    f = f[f["Location"] == sel_loc]
-
-# -------------------------
-# 5) KPI cards
-# -------------------------
-st.write("### KPIs")
-total_impr = int(f["Impressions"].sum())
-total_clicks = int(f["Clicks"].sum())
-ctr = (f["CTR"].mean()*100) if f["CTR"].notna().any() else 0
-avg_roi = f["ROI"].mean() if "ROI" in f.columns else np.nan
-avg_cr = (f["Conversion_Rate"].mean()*100) if "Conversion_Rate" in f.columns else np.nan
-est_spend = f["Est_Spend"].sum() if f["Est_Spend"].notna().any() else np.nan
-
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Impressions", f"{total_impr:,}")
-c2.metric("Clicks", f"{total_clicks:,}")
-c3.metric("Avg CTR", f"{ctr:.2f}%")
-c4.metric("Avg ROI", f"{avg_roi:.2f}" if pd.notna(avg_roi) else "—")
-c5.metric("Est. Spend", f"${est_spend:,.0f}" if pd.notna(est_spend) else "—")
-st.caption("Est. Spend ≈ Acquisition_Cost × (Conversion_Rate × Impressions)")
-
-st.divider()
-
-# -------------------------
-# 6) Trends
-# -------------------------
-st.subheader("📈 Trends over time")
-daily = f.groupby("Date").agg(
-    Impressions=("Impressions","sum"),
-    Clicks=("Clicks","sum"),
-    ROI=("ROI","mean"),
-    CR=("Conversion_Rate","mean")
-).reset_index()
-if len(daily):
-    daily["CTR"] = np.where(daily["Impressions"]>0, daily["Clicks"]/daily["Impressions"], np.nan)
-    fig_ctr = px.line(daily, x="Date", y="CTR", markers=True, title="CTR over time")
-    st.plotly_chart(fig_ctr, use_container_width=True)
-    fig_roi = px.line(daily, x="Date", y="ROI", markers=True, title="ROI over time")
-    st.plotly_chart(fig_roi, use_container_width=True)
-else:
-    st.info("No rows after filters to plot trends.")
-
-st.divider()
-
-# -------------------------
-# 7) Channel comparison
-# -------------------------
-st.subheader("📊 Channel performance")
-if len(f):
-    by_ch = f.groupby("Channel_Used").agg(
-        Impressions=("Impressions","sum"),
-        Clicks=("Clicks","sum"),
-        ROI=("ROI","mean"),
-        CR=("Conversion_Rate","mean")
-    ).reset_index()
-    by_ch["CTR"] = np.where(by_ch["Impressions"]>0, by_ch["Clicks"]/by_ch["Impressions"], np.nan)
-
-    colA, colB = st.columns(2)
-    with colA:
-        st.markdown("**CTR by channel**")
-        st.plotly_chart(px.bar(by_ch, x="Channel_Used", y="CTR", title="CTR by channel"), use_container_width=True)
-    with colB:
-        st.markdown("**ROI by channel**")
-        st.plotly_chart(px.bar(by_ch, x="Channel_Used", y="ROI", title="ROI by channel"), use_container_width=True)
-else:
-    st.info("No channel data after filters.")
-
-st.divider()
-
-# -------------------------
-# 8) Audience × Channel heatmap
-# -------------------------
-st.subheader("🧩 Audience × Channel (Conversion Rate)")
-if {"Target_Audience","Channel_Used","Conversion_Rate"}.issubset(f.columns):
-    heat = f.pivot_table(index="Target_Audience", columns="Channel_Used", values="Conversion_Rate", aggfunc="mean")
-    heat = heat.round(3)
-    st.plotly_chart(px.imshow(heat, text_auto=True, aspect="auto", title="Avg Conversion Rate heatmap"),
-                    use_container_width=True)
-else:
-    st.info("Need Target_Audience, Channel_Used, and Conversion_Rate for the heatmap.")
-
-st.divider()
-
-# -------------------------
-# 9) Top & bottom performers
-# -------------------------
-st.subheader("🏆 Top & Bottom performers (by ROI)")
-segment_cols = [c for c in ["Company","Target_Audience","Channel_Used","Campaign_Goal","Location"] if c in f.columns]
-if "ROI" in f.columns and segment_cols:
-    seg = f.groupby(segment_cols).agg(
-        Impressions=("Impressions","sum"),
-        Clicks=("Clicks","sum"),
-        ROI=("ROI","mean"),
-        CR=("Conversion_Rate","mean")
-    ).reset_index()
-    seg = seg[seg["Impressions"] > 0]
-    seg["CTR"] = seg["Clicks"] / seg["Impressions"]
-
-    top = seg.sort_values("ROI", ascending=False).head(10)
-    low = seg.sort_values("ROI", ascending=True).head(10)
-
-    colT, colL = st.columns(2)
-    colT.markdown("**Top 10 by ROI**"); colT.dataframe(top, use_container_width=True)
-    colL.markdown("**Bottom 10 by ROI**"); colL.dataframe(low, use_container_width=True)
-else:
-    st.info("ROI or segment columns missing.")
-
-st.divider()
-
-# -------------------------
-# 10) Recommendations (simple rules)
-# -------------------------
-st.subheader("🧭 Recommendations")
-recs = []
-
-if len(f):
-    # Channel winners
-    by_ch2 = f.groupby("Channel_Used")["ROI"].mean().sort_values(ascending=False) if "ROI" in f.columns else pd.Series(dtype=float)
-    if len(by_ch2) >= 1:
-        best = by_ch2.index[0]
-        recs.append(f"Shift budget toward **{best}** (highest average ROI). Test +10–20% reallocation next cycle.")
-
-    # CTR leader for awareness/traffic
-    if {"Impressions","Clicks","Channel_Used"}.issubset(f.columns):
-        by_ch_ctr = f.groupby("Channel_Used").apply(lambda x: (x["Clicks"].sum()/x["Impressions"].sum()) if x["Impressions"].sum()>0 else np.nan)
-        by_ch_ctr = by_ch_ctr.sort_values(ascending=False)
-        if len(by_ch_ctr) >= 1:
-            ctr_best = by_ch_ctr.index[0]
-            recs.append(f"Use **{ctr_best}** for awareness/traffic (best CTR).")
-
-    # Audience × Channel hotspots
+    st.subheader("Audience × Channel (Conversion Rate)")
     if {"Target_Audience","Channel_Used","Conversion_Rate"}.issubset(f.columns):
-        hot = f.groupby(["Target_Audience","Channel_Used"])["Conversion_Rate"].mean().sort_values(ascending=False).head(3)
-        if len(hot):
-            pairs = ", ".join([f"{a}×{c}" for (a,c) in hot.index])
-            recs.append(f"Double-down on high-CR combos: {pairs}.")
+        heat = f.pivot_table(index="Target_Audience", columns="Channel_Used",
+                             values="Conversion_Rate", aggfunc="mean").round(3)
+        st.plotly_chart(px.imshow(heat, text_auto=True, aspect="auto", title="Avg Conversion Rate heatmap"),
+                        use_container_width=True)
 
-    # Goal-specific
-    if {"Campaign_Goal","ROI"}.issubset(f.columns):
-        goal_roi = f.groupby("Campaign_Goal")["ROI"].mean().sort_values(ascending=False)
-        if len(goal_roi):
-            top_goal = goal_roi.index[0]
-            recs.append(f"For **{top_goal}** goals, replicate top creatives/targeting from best channels.")
+    st.subheader("Top & Bottom performers (by ROI)")
+    segment_cols = [c for c in ["Company","Target_Audience","Channel_Used","Campaign_Goal","Location"] if c in f.columns]
+    if "ROI" in f.columns and segment_cols:
+        seg = f.groupby(segment_cols).agg(Impressions=("Impressions","sum"),
+                                          Clicks=("Clicks","sum"),
+                                          ROI=("ROI","mean")).reset_index()
+        seg = seg[seg["Impressions"] > 0]
+        seg["CTR"] = seg["Clicks"] / seg["Impressions"]
+        top = seg.sort_values("ROI", ascending=False).head(10)
+        low = seg.sort_values("ROI", ascending=True).head(10)
+        tA, tB = st.columns(2)
+        tA.markdown("**Top 10**"); tA.dataframe(top, use_container_width=True)
+        tB.markdown("**Bottom 10**"); tB.dataframe(low, use_container_width=True)
 
-    # Spend vs ROI sanity (if Acquisition_Cost given)
-    if f["Est_Spend"].notna().any() and "ROI" in f.columns:
-        cost_roi = f[["Est_Spend","ROI"]].dropna()
-        if len(cost_roi) > 50:
-            corr = cost_roi.corr(numeric_only=True).loc["Est_Spend","ROI"]
-            if pd.notna(corr) and corr < 0:
-                recs.append("High spend correlates with lower ROI — narrow targeting or improve creatives.")
+with tab2:
+    st.subheader("Train a simple model and predict")
+    target = st.selectbox("Target to predict", ["ROI", "Conversion_Rate", "CTR"], index=0)
 
-if recs:
-    for r in recs: st.markdown(f"- {r}")
-else:
-    st.write("No strong signals yet. Keep monitoring and A/B test creatives + narrower segments.")
+    feature_cats = [c for c in ["Channel_Used","Target_Audience","Campaign_Goal","Company","Location"] if c in df.columns]
+    feature_nums = [c for c in ["Impressions","Clicks","Engagement_Score"] if c in df.columns]
+
+    usable = df.dropna(subset=[target]).copy()
+    if target == "CTR":
+        # avoid trivial leakage: if predicting CTR, drop CTR components from features if desired
+        # keep it simple: allow Impressions/Clicks but note it's optimistic
+        pass
+
+    X = usable[feature_cats + feature_nums].copy()
+    y = usable[target].astype(float)
+
+    for c in feature_nums:
+        X[c] = pd.to_numeric(X[c], errors="coerce")
+    X = X.dropna()
+
+    y = y.loc[X.index]
+
+    if len(X) < 200:
+        st.info("Not enough rows to train. Adjust target or provide more data.")
+        st.stop()
+
+    pre = ColumnTransformer([
+        ("cat", OneHotEncoder(handle_unknown="ignore"), feature_cats),
+        ("num", "passthrough", feature_nums)
+    ])
+
+    model = RandomForestRegressor(n_estimators=200, random_state=42)
+    pipe = Pipeline([("prep", pre), ("rf", model)])
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    pipe.fit(X_train, y_train)
+
+    y_pred = pipe.predict(X_test)
+    r2 = r2_score(y_test, y_pred)
+    mae = mean_absolute_error(y_test, y_pred)
+
+    m1, m2 = st.columns(2)
+    m1.metric("R² (test)", f"{r2:.3f}")
+    m2.metric("MAE (test)", f"{mae:.3f}")
+
+    st.markdown("---")
+    st.markdown("**Enter campaign parameters to get a prediction**")
+
+    def pick(col, fallback=""):
+        if col not in df.columns: return fallback
+        vals = sorted(df[col].dropna().unique().tolist())
+        return st.selectbox(col, vals) if vals else fallback
+
+    in_channel  = pick("Channel_Used")
+    in_aud      = pick("Target_Audience")
+    in_goal     = pick("Campaign_Goal")
+    in_company  = pick("Company")
+    in_loc      = pick("Location")
+
+    def num_input(name, default_col=None):
+        default = float(df[default_col].median()) if default_col in df.columns else 0.0
+        return st.number_input(name, value=float(default), step=1.0, format="%.0f") if name in ["Impressions","Clicks"] else \
+               st.number_input(name, value=float(df[default_col].median()) if default_col in df.columns else 0.0, step=0.1)
+
+    in_impr = num_input("Impressions", "Impressions") if "Impressions" in feature_nums else None
+    in_clicks = num_input("Clicks", "Clicks") if "Clicks" in feature_nums else None
+    in_eng = st.number_input("Engagement_Score", value=float(df["Engagement_Score"].median()) if "Engagement_Score" in df.columns else 0.0, step=0.1) if "Engagement_Score" in feature_nums else None
+
+    input_row = pd.DataFrame([{
+        "Channel_Used": in_channel,
+        "Target_Audience": in_aud,
+        "Campaign_Goal": in_goal,
+        "Company": in_company,
+        "Location": in_loc,
+        "Impressions": in_impr if in_impr is not None else np.nan,
+        "Clicks": in_clicks if in_clicks is not None else np.nan,
+        "Engagement_Score": in_eng if in_eng is not None else np.nan
+    }])
+
+    if st.button("Predict"):
+        pred = pipe.predict(input_row[feature_cats + feature_nums])[0]
+        label = {"ROI":"Predicted ROI", "Conversion_Rate":"Predicted Conversion Rate", "CTR":"Predicted CTR"}[target]
+        if target in ["Conversion_Rate", "CTR"]:
+            st.success(f"{label}: {pred:.4f} ({pred*100:.2f}%)")
+        else:
+            st.success(f"{label}: {pred:.4f}")
+
+    st.caption("Note: Simple Random Forest on structured features. For CTR target, using Clicks/Impressions as inputs can be optimistic; you can remove them to be stricter.")
