@@ -6,10 +6,14 @@ import plotly.express as px
 
 st.set_page_config(page_title="Social Media Ads BI", layout="wide")
 st.title("📊 Social Media Advertising — BI Dashboard")
+st.caption("Build v1.1 (with safe ROI prediction)")
 
 REQUIRED = ["Date", "Channel_Used", "Target_Audience", "Impressions", "Clicks", "Conversion_Rate", "ROI"]
 OPTIONAL = ["Company", "Location", "Campaign_Goal"]
 
+# -------------------------------
+# Load CSV (upload or /data file)
+# -------------------------------
 st.sidebar.header("Upload CSV")
 up = st.sidebar.file_uploader("Choose a CSV (must have required columns)", type=["csv"])
 
@@ -23,19 +27,36 @@ else:
         st.info("Upload a CSV or place Social_Media_Advertising.csv in /data")
         st.stop()
 
-if not set(REQUIRED).issubset(df.columns):
-    st.error(f"Missing columns: {', '.join([c for c in REQUIRED if c not in df.columns])}")
+# -------------------------------
+# Quick debug info (very helpful)
+# -------------------------------
+with st.expander("🔍 Debug: dataset snapshot"):
+    st.write("Rows:", len(df))
+    st.write("Columns:", list(df.columns))
+    st.write("Dtypes:", df.dtypes.astype(str).to_dict())
     st.dataframe(df.head(), use_container_width=True)
+
+# -------------------------------
+# Basic validation & cleaning
+# -------------------------------
+missing = [c for c in REQUIRED if c not in df.columns]
+if missing:
+    st.error(f"Missing required columns: {', '.join(missing)}")
     st.stop()
 
 df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
 for c in ["Impressions", "Clicks", "Conversion_Rate", "ROI"]:
     df[c] = pd.to_numeric(df[c], errors="coerce")
+
 df["CTR"] = np.where(df["Impressions"] > 0, df["Clicks"] / df["Impressions"], np.nan)
 
+# -------------------------------
+# Filters
+# -------------------------------
 st.sidebar.header("Filters")
 dmin, dmax = df["Date"].min(), df["Date"].max()
 date_range = st.sidebar.date_input("Date range", (dmin, dmax))
+
 f = df.copy()
 if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
     start, end = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
@@ -54,6 +75,9 @@ if sel_audience != "All": f = f[f["Target_Audience"] == sel_audience]
 if sel_company != "All" and "Company" in f.columns:  f = f[f["Company"] == sel_company]
 if sel_loc != "All" and "Location" in f.columns:     f = f[f["Location"] == sel_loc]
 
+# -------------------------------
+# KPIs
+# -------------------------------
 total_impr  = int(f["Impressions"].sum())
 total_clicks = int(f["Clicks"].sum())
 avg_ctr = (f["CTR"].mean() * 100) if f["CTR"].notna().any() else 0
@@ -66,6 +90,9 @@ c2.metric("Clicks", f"{total_clicks:,}")
 c3.metric("Avg CTR", f"{avg_ctr:.2f}%")
 c4.metric("Avg ROI", f"{avg_roi:.2f}" if pd.notna(avg_roi) else "—")
 
+# -------------------------------
+# Trends
+# -------------------------------
 st.subheader("Trends")
 daily = f.groupby("Date").agg(Impressions=("Impressions","sum"),
                               Clicks=("Clicks","sum"),
@@ -78,6 +105,9 @@ if len(daily):
 else:
     st.info("No rows to plot after filters.")
 
+# -------------------------------
+# Channel performance
+# -------------------------------
 st.subheader("Channel performance")
 if "Channel_Used" in f.columns and len(f):
     by_ch = f.groupby("Channel_Used").agg(Impressions=("Impressions","sum"),
@@ -88,6 +118,9 @@ if "Channel_Used" in f.columns and len(f):
     colA.plotly_chart(px.bar(by_ch, x="Channel_Used", y="CTR", title="CTR by channel"), use_container_width=True)
     colB.plotly_chart(px.bar(by_ch, x="Channel_Used", y="ROI", title="ROI by channel"), use_container_width=True)
 
+# -------------------------------
+# Audience × Channel heatmap
+# -------------------------------
 st.subheader("Audience × Channel (Conversion Rate)")
 if {"Target_Audience","Channel_Used","Conversion_Rate"}.issubset(f.columns):
     heat = f.pivot_table(index="Target_Audience", columns="Channel_Used", values="Conversion_Rate", aggfunc="mean")
@@ -95,6 +128,9 @@ if {"Target_Audience","Channel_Used","Conversion_Rate"}.issubset(f.columns):
     st.plotly_chart(px.imshow(heat, text_auto=True, aspect="auto", title="Avg Conversion Rate heatmap"),
                     use_container_width=True)
 
+# -------------------------------
+# Top & Bottom performers
+# -------------------------------
 st.subheader("Top & Bottom performers (by ROI)")
 segment_cols = [c for c in ["Company","Target_Audience","Channel_Used","Campaign_Goal","Location"] if c in f.columns]
 if "ROI" in f.columns and segment_cols:
@@ -109,6 +145,9 @@ if "ROI" in f.columns and segment_cols:
     colT.markdown("**Top 10**"); colT.dataframe(top, use_container_width=True)
     colL.markdown("**Bottom 10**"); colL.dataframe(low, use_container_width=True)
 
+# -------------------------------
+# Recommendations
+# -------------------------------
 st.subheader("Recommendations")
 recs = []
 if len(f):
@@ -131,70 +170,80 @@ if recs:
 else:
     st.write("No strong signals yet. Adjust filters or collect more data.")
 
-# =========================
-# Prediction (ROI) — Simple
-# =========================
+# ===================================================
+# ROI Prediction (safe, guarded; won't crash the app)
+# ===================================================
 st.divider()
 st.header("🤖 ROI Prediction")
 
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.metrics import r2_score, mean_absolute_error
+try:
+    from sklearn.model_selection import train_test_split
+    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.preprocessing import OneHotEncoder
+    from sklearn.compose import ColumnTransformer
+    from sklearn.pipeline import Pipeline
+    from sklearn.metrics import r2_score, mean_absolute_error
 
-feature_pool = ["Channel_Used", "Target_Audience", "Campaign_Goal", "Impressions", "Clicks"]
-available = [c for c in feature_pool if c in df.columns]
-if "ROI" in df.columns and len(available) >= 3:
-    df_model = df[available + ["ROI"]].dropna()
-    if len(df_model) >= 200:
-        X = df_model[available]
-        y = df_model["ROI"]
+    feature_pool = ["Channel_Used", "Target_Audience", "Campaign_Goal", "Impressions", "Clicks"]
+    available = [c for c in feature_pool if c in df.columns]
 
-        cat_cols = [c for c in ["Channel_Used", "Target_Audience", "Campaign_Goal"] if c in available]
-        num_cols = [c for c in ["Impressions", "Clicks"] if c in available]
-
-        pre = ColumnTransformer([
-            ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols),
-            ("num", "passthrough", num_cols)
-        ])
-
-        pipe = Pipeline([
-            ("prep", pre),
-            ("model", RandomForestRegressor(n_estimators=200, random_state=42))
-        ])
-
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        pipe.fit(X_train, y_train)
-        y_pred = pipe.predict(X_test)
-        r2 = r2_score(y_test, y_pred)
-        mae = mean_absolute_error(y_test, y_pred)
-
-        cA, cB = st.columns(2)
-        cA.metric("R² (test)", f"{r2:.2f}")
-        cB.metric("MAE (test)", f"{mae:.2f}")
-
-        st.subheader("Try a prediction")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            ch_val = st.selectbox("Channel_Used", sorted(df["Channel_Used"].dropna().unique().tolist()))
-            au_val = st.selectbox("Target_Audience", sorted(df["Target_Audience"].dropna().unique().tolist()))
-        with col2:
-            go_val = st.selectbox("Campaign_Goal", sorted(df["Campaign_Goal"].dropna().unique().tolist())) if "Campaign_Goal" in df.columns else ""
-            imp_val = st.number_input("Impressions", min_value=0, value=int(df["Impressions"].median()))
-        with col3:
-            clk_val = st.number_input("Clicks", min_value=0, value=int(df["Clicks"].median()))
-
-        btn = st.button("Predict ROI")
-        if btn:
-            row = {"Channel_Used": ch_val, "Target_Audience": au_val}
-            if "Campaign_Goal" in available: row["Campaign_Goal"] = go_val
-            if "Impressions" in available:   row["Impressions"] = imp_val
-            if "Clicks" in available:        row["Clicks"] = clk_val
-            pred = float(pipe.predict(pd.DataFrame([row]))[0])
-            st.success(f"Predicted ROI: {pred:.2f}")
+    if "ROI" not in df.columns:
+        st.info("ROI column not found — cannot train ROI predictor.")
+    elif len(available) < 3:
+        st.info("Need at least 3 of these features to train: Channel_Used, Target_Audience, Campaign_Goal, Impressions, Clicks.")
     else:
-        st.info("Not enough rows to train a stable model (need ≥ 200 after dropping NA).")
-else:
-    st.info("ROI prediction needs at least 3 of: Channel_Used, Target_Audience, Campaign_Goal, Impressions, Clicks.")
+        df_model = df[available + ["ROI"]].dropna()
+        if len(df_model) < 200:
+            st.info("Not enough rows to train a stable model (need ≥ 200 after dropping NA).")
+        else:
+            X = df_model[available]
+            y = df_model["ROI"]
+
+            cat_cols = [c for c in ["Channel_Used", "Target_Audience", "Campaign_Goal"] if c in available]
+            num_cols = [c for c in ["Impressions", "Clicks"] if c in available]
+
+            pre = ColumnTransformer([
+                ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols),
+                ("num", "passthrough", num_cols)
+            ])
+
+            pipe = Pipeline([
+                ("prep", pre),
+                ("model", RandomForestRegressor(n_estimators=200, random_state=42))
+            ])
+
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+            pipe.fit(X_train, y_train)
+            y_pred = pipe.predict(X_test)
+            r2 = r2_score(y_test, y_pred)
+            mae = mean_absolute_error(y_test, y_pred)
+
+            m1, m2 = st.columns(2)
+            m1.metric("R² (test)", f"{r2:.2f}")
+            m2.metric("MAE (test)", f"{mae:.2f}")
+
+            st.subheader("Try a prediction")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                ch_val = st.selectbox("Channel_Used", sorted(df["Channel_Used"].dropna().unique().tolist()))
+                au_val = st.selectbox("Target_Audience", sorted(df["Target_Audience"].dropna().unique().tolist()))
+            with col2:
+                if "Campaign_Goal" in df.columns:
+                    go_val = st.selectbox("Campaign_Goal", sorted(df["Campaign_Goal"].dropna().unique().tolist()))
+                else:
+                    go_val = ""
+                imp_val = st.number_input("Impressions", min_value=0, value=int(df["Impressions"].median()))
+            with col3:
+                clk_val = st.number_input("Clicks", min_value=0, value=int(df["Clicks"].median()))
+
+            if st.button("Predict ROI"):
+                row = {"Channel_Used": ch_val, "Target_Audience": au_val}
+                if "Campaign_Goal" in available: row["Campaign_Goal"] = go_val
+                if "Impressions" in available:   row["Impressions"] = imp_val
+                if "Clicks" in available:        row["Clicks"] = clk_val
+                pred = float(pipe.predict(pd.DataFrame([row]))[0])
+                st.success(f"Predicted ROI: {pred:.2f}")
+
+except Exception as e:
+    st.error(f"Prediction module error: {e}")
+    st.caption("Tip: Ensure 'scikit-learn' is in requirements.txt and your CSV has enough rows & required columns.")
