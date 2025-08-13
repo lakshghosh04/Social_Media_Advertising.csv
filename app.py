@@ -130,3 +130,71 @@ if recs:
     for r in recs: st.markdown(f"- {r}")
 else:
     st.write("No strong signals yet. Adjust filters or collect more data.")
+
+# =========================
+# Prediction (ROI) — Simple
+# =========================
+st.divider()
+st.header("🤖 ROI Prediction")
+
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import r2_score, mean_absolute_error
+
+feature_pool = ["Channel_Used", "Target_Audience", "Campaign_Goal", "Impressions", "Clicks"]
+available = [c for c in feature_pool if c in df.columns]
+if "ROI" in df.columns and len(available) >= 3:
+    df_model = df[available + ["ROI"]].dropna()
+    if len(df_model) >= 200:
+        X = df_model[available]
+        y = df_model["ROI"]
+
+        cat_cols = [c for c in ["Channel_Used", "Target_Audience", "Campaign_Goal"] if c in available]
+        num_cols = [c for c in ["Impressions", "Clicks"] if c in available]
+
+        pre = ColumnTransformer([
+            ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols),
+            ("num", "passthrough", num_cols)
+        ])
+
+        pipe = Pipeline([
+            ("prep", pre),
+            ("model", RandomForestRegressor(n_estimators=200, random_state=42))
+        ])
+
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        pipe.fit(X_train, y_train)
+        y_pred = pipe.predict(X_test)
+        r2 = r2_score(y_test, y_pred)
+        mae = mean_absolute_error(y_test, y_pred)
+
+        cA, cB = st.columns(2)
+        cA.metric("R² (test)", f"{r2:.2f}")
+        cB.metric("MAE (test)", f"{mae:.2f}")
+
+        st.subheader("Try a prediction")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            ch_val = st.selectbox("Channel_Used", sorted(df["Channel_Used"].dropna().unique().tolist()))
+            au_val = st.selectbox("Target_Audience", sorted(df["Target_Audience"].dropna().unique().tolist()))
+        with col2:
+            go_val = st.selectbox("Campaign_Goal", sorted(df["Campaign_Goal"].dropna().unique().tolist())) if "Campaign_Goal" in df.columns else ""
+            imp_val = st.number_input("Impressions", min_value=0, value=int(df["Impressions"].median()))
+        with col3:
+            clk_val = st.number_input("Clicks", min_value=0, value=int(df["Clicks"].median()))
+
+        btn = st.button("Predict ROI")
+        if btn:
+            row = {"Channel_Used": ch_val, "Target_Audience": au_val}
+            if "Campaign_Goal" in available: row["Campaign_Goal"] = go_val
+            if "Impressions" in available:   row["Impressions"] = imp_val
+            if "Clicks" in available:        row["Clicks"] = clk_val
+            pred = float(pipe.predict(pd.DataFrame([row]))[0])
+            st.success(f"Predicted ROI: {pred:.2f}")
+    else:
+        st.info("Not enough rows to train a stable model (need ≥ 200 after dropping NA).")
+else:
+    st.info("ROI prediction needs at least 3 of: Channel_Used, Target_Audience, Campaign_Goal, Impressions, Clicks.")
