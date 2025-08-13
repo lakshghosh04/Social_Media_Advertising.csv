@@ -1,3 +1,16 @@
+# ==== 1. Load Data ====
+import pandas as pd
+import streamlit as st
+
+st.set_page_config(page_title="Social Media Ad Dashboard", layout="wide")
+
+@st.cache_data
+def load_data():
+    return pd.read_csv("Social_Media_Advertising.csv")
+
+df = load_data()
+
+# ==== 2. Model Training ====
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder
@@ -5,19 +18,16 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 import joblib
 
-# Select features and target
 features = ["Channel_Used", "Target_Audience", "Campaign_Goal", "Impressions", "Clicks"]
 target = "ROI"
 
-# Drop missing values
 df_model = df[features + [target]].dropna()
 
-# Train-test split
 X = df_model[features]
 y = df_model[target]
+
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-# Preprocess: One-hot encode categorical columns
 categorical_cols = ["Channel_Used", "Target_Audience", "Campaign_Goal"]
 numeric_cols = ["Impressions", "Clicks"]
 
@@ -28,19 +38,15 @@ preprocessor = ColumnTransformer(
     ]
 )
 
-# Create pipeline
 model_pipeline = Pipeline([
     ("preprocessor", preprocessor),
     ("model", RandomForestRegressor(n_estimators=100, random_state=42))
 ])
 
-# Train
 model_pipeline.fit(X_train, y_train)
-
-# Save model
 joblib.dump(model_pipeline, "roi_predictor.pkl")
 
-# ==== DASHBOARD INPUT & PREDICTION ====
+# ==== 3. Sidebar Form ====
 st.sidebar.header("ROI Prediction Tool")
 with st.sidebar.form("prediction_form"):
     channel = st.selectbox("Channel Used", df["Channel_Used"].unique())
@@ -51,9 +57,7 @@ with st.sidebar.form("prediction_form"):
     submit = st.form_submit_button("Predict ROI")
 
 if submit:
-    # Load model
     model = joblib.load("roi_predictor.pkl")
-    # Prepare input
     input_df = pd.DataFrame([{
         "Channel_Used": channel,
         "Target_Audience": audience,
@@ -61,6 +65,5 @@ if submit:
         "Impressions": impressions,
         "Clicks": clicks
     }])
-    # Predict
     prediction = model.predict(input_df)[0]
     st.sidebar.success(f"Predicted ROI: {prediction:.2f}")
